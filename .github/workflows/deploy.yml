@@ -1,0 +1,104 @@
+name: Deploy Image
+
+on:
+  workflow_call:
+    inputs:
+      rs_release:
+        description: "ResourceSpace release branch, e.g. 11.0"
+        required: true
+        type: string
+      rs_revision:
+        description: "SVN revision of the release branch"
+        required: true
+        type: string
+      version:
+        description: "Image version, e.g. 11.0-r12345"
+        required: true
+        type: string
+      tags:
+        description: "Newline-delimited image tags to publish"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_DESCRIPTION: ResourceSpace digital asset management, configured via environment variables
+  TEST_IMAGE: resourcespace:smoke-test
+
+jobs:
+  test:
+    name: Build and Smoke Test (amd64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build test image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          build-args: |
+            RS_RELEASE=${{ inputs.rs_release }}
+            RS_REVISION=${{ inputs.rs_revision }}
+          tags: ${{ env.TEST_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run smoke test
+        run: bash tests/smoke-test.sh "${TEST_IMAGE}"
+
+  deploy:
+    name: Build and Push
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            RS_RELEASE=${{ inputs.rs_release }}
+            RS_REVISION=${{ inputs.rs_revision }}
+          tags: ${{ inputs.tags }}
+          cache-from: type=gha
+          annotations: |
+            index:org.opencontainers.image.description=${{ env.IMAGE_DESCRIPTION }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=${{ env.IMAGE_DESCRIPTION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ inputs.version }}

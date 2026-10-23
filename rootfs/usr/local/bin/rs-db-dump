@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Writes a compressed dump of the ResourceSpace database to the data volume.
+# The file is replaced atomically, so the sync never picks up a half-written dump.
+set -Eeuo pipefail
+
+DB_NAME="${RS_DB_NAME:-$(sed -n "s/^\$mysql_db = '\(.*\)';$/\1/p" "${RS_WEBROOT:-/var/www/html}/include/config.php")}"
+TARGET_DIR=/data/db-dump
+TARGET="${TARGET_DIR}/resourcespace.sql.gz"
+TMP="${TARGET_DIR}/.resourcespace.sql.gz.tmp"
+
+mkdir -p "${TARGET_DIR}"
+trap 'rm -f "${TMP}"' EXIT
+
+if mariadb-dump "${DB_NAME}" | gzip -6 > "${TMP}" && gzip -t "${TMP}"; then
+  mv -f "${TMP}" "${TARGET}"
+  chmod 0640 "${TARGET}"
+  echo "[rs-db-dump] $(date -Is) Dump erstellt: ${TARGET} ($(du -h "${TARGET}" | cut -f1))"
+else
+  echo "[rs-db-dump] $(date -Is) FEHLER: Dump fehlgeschlagen." >&2
+  exit 1
+fi

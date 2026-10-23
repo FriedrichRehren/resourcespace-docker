@@ -1,0 +1,130 @@
+name: Check Upstream Release
+
+# Watches the ResourceSpace SVN release branches and publishes an image when
+#  - a new revision of the newest release branch appeared (daily),
+#  - the base image should be refreshed for security updates (weekly, forced),
+#  - the packaging in this repository changed (push to main, forced),
+#  - it is started manually (optionally forced and/or pinned to a release).
+
+on:
+  schedule:
+    - cron: "17 4 * * *"   # daily upstream check
+    - cron: "47 4 * * 1"   # weekly forced rebuild (Ubuntu security updates)
+  push:
+    branches:
+      - main
+    paths:
+      - Dockerfile
+      - rootfs/**
+      - tests/**
+      - .github/workflows/check-upstream.yml
+      - .github/workflows/deploy.yml
+  workflow_dispatch:
+    inputs:
+      rs_release:
+        description: 'ResourceSpace release branch (e.g. 11.0), or "latest"'
+        required: true
+        default: "latest"
+      force:
+        description: "Build even if the image tag already exists"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-image
+  cancel-in-progress: false
+
+env:
+  SVN_RELEASES: https://svn.resourcespace.com/svn/rs/releases
+  DOCKERHUB_IMAGE: docker.io/friedrichrehren/resourcespace
+
+jobs:
+  check:
+    name: Check Latest Upstream Revision
+    runs-on: ubuntu-latest
+
+    outputs:
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+      rs_release: ${{ steps.check.outputs.rs_release }}
+      rs_revision: ${{ steps.check.outputs.rs_revision }}
+      version: ${{ steps.check.outputs.version }}
+      tags: ${{ steps.check.outputs.tags }}
+
+    steps:
+      - name: Install Subversion
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq subversion
+
+      - name: Check latest upstream revision
+        id: check
+        shell: bash
+        env:
+          INPUT_RELEASE: ${{ inputs.rs_release || vars.RS_RELEASE || 'latest' }}
+          FORCE: ${{ (github.event_name == 'push' || github.event.schedule == '47 4 * * 1' || inputs.force) && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          ghcr_image="ghcr.io/${owner}/resourcespace"
+
+          newest="$(svn ls "${SVN_RELEASES}/" | sed -n 's#^\([0-9][0-9.]*\)/$#\1#p' | sort -V | tail -n1)"
+          if [[ "${INPUT_RELEASE}" == "latest" ]]; then
+            release="${newest}"
+          else
+            release="${INPUT_RELEASE}"
+          fi
+          [[ -n "${release}" ]] || { echo "No release branch found" >&2; exit 1; }
+
+          revision="$(svn info --show-item last-changed-revision "${SVN_RELEASES}/${release}")"
+          version="${release}-r${revision}"
+
+          echo "Newest release branch: ${newest}"
+          echo "Selected release:      ${release}"
+          echo "Revision:              ${revision}"
+          echo "Image version:         ${version}"
+          echo "Forced:                ${FORCE}"
+
+          {
+            echo "rs_release=${release}"
+            echo "rs_revision=${revision}"
+            echo "version=${version}"
+          } >> "${GITHUB_OUTPUT}"
+
+          exists() { docker buildx imagetools inspect "$1" >/dev/null 2>&1; }
+
+          if [[ "${FORCE}" != "true" ]] \
+             && exists "${ghcr_image}:${version}" \
+             && exists "${DOCKERHUB_IMAGE}:${version}"; then
+            echo "${version} is already published"
+            echo "should_deploy=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "should_deploy=true" >> "${GITHUB_OUTPUT}"
+          {
+            echo "tags<<EOF"
+            for image in "${ghcr_image}" "${DOCKERHUB_IMAGE}"; do
+              echo "${image}:${version}"
+              echo "${image}:${release}"
+              if [[ "${release}" == "${newest}" ]]; then
+                echo "${image}:latest"
+              fi
+            done
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+  deploy:
+    name: Deploy Image
+    needs: check
+    if: needs.check.outputs.should_deploy == 'true'
+    uses: ./.github/workflows/deploy.yml
+    with:
+      rs_release: ${{ needs.check.outputs.rs_release }}
+      rs_revision: ${{ needs.check.outputs.rs_revision }}
+      version: ${{ needs.check.outputs.version }}
+      tags: ${{ needs.check.outputs.tags }}
+    secrets: inherit

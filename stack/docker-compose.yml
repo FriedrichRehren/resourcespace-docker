@@ -1,0 +1,218 @@
+# =============================================================================
+#  ResourceSpace + SharePoint – Portainer Stack
+# =============================================================================
+#
+#  Container                Volumes
+#  ----------------------   -------------------------------------------------
+#  rclone   (Sync)          data, rclone_config
+#  mariadb  (Datenbank)     db
+#  resourcespace (Web/UI)   data
+#
+#  Volume "data":
+#    filestore/   Originale + Vorschauen (ResourceSpace)     -> SharePoint
+#    filestore/plugins/  Zusatz-Plugins (PHP-Code)          (nicht synchronisiert)
+#    db-dump/     Datenbank-Dump, alle 6 h                   -> SharePoint
+#    config/      optionale config.local.php                 -> SharePoint
+#    tmp/         Temporäre Dateien                          (nicht synchronisiert)
+#    .rclone/     Sync-Status                                (nicht synchronisiert)
+#
+#  Startreihenfolge: rclone (erster Abgleich ok) + mariadb (healthy) -> resourcespace
+#
+#  Stack-Umgebungsvariablen – Pflicht:
+#    RS_DOMAIN             photo.deutausges.de
+#    MYSQL_ROOT_PASSWORD   openssl rand -hex 24
+#    MYSQL_PASSWORD        openssl rand -hex 24
+#    RS_SCRAMBLE_KEY       openssl rand -hex 32   (NIE ändern, siehe README)
+#    RS_API_SCRAMBLE_KEY   openssl rand -hex 32   (NIE ändern)
+#    RS_ADMIN_PASSWORD     NICHT genau 32 oder 64 Zeichen lang
+#    RS_ADMIN_EMAIL        admin@deutausges.de
+#
+#  Optional (Defaults in Klammern):
+#    RS_IMAGE              (friedrichrehren/resourcespace:latest)
+#    RS_ADMIN_USERNAME     (admin)
+#    RS_ADMIN_FORCE_PASSWORD (false) – true setzt das Passwort bei jedem Start
+#    RS_EMAIL_FROM, RS_SMTP_HOST, RS_SMTP_PORT, RS_SMTP_USER, RS_SMTP_PASSWORD
+#    SHAREPOINT_REMOTE     (sharepoint:)    Name des rclone-Remotes
+#    SHAREPOINT_PATH       (resourcespace)  Ordner in der Bibliothek
+#    SYNC_INTERVAL         (300)            Sekunden zwischen zwei Abgleichen
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # rclone: gleicht das Volume "data" in beide Richtungen mit SharePoint ab
+  # ---------------------------------------------------------------------------
+  rclone:
+    image: rclone/rclone:latest
+    restart: unless-stopped
+    environment:
+      SHAREPOINT_REMOTE: ${SHAREPOINT_REMOTE:-sharepoint:}
+      SHAREPOINT_PATH: ${SHAREPOINT_PATH-resourcespace}
+      SYNC_INTERVAL: ${SYNC_INTERVAL:-300}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -u
+        STATE=/data/.rclone
+        WORKDIR="$$STATE/bisync"
+        mkdir -p "$$STATE" "$$WORKDIR"
+        rm -f "$$STATE/ready" "$$STATE/last_ok"
+
+        if [ ! -s /config/rclone/rclone.conf ]; then
+          echo "============================================================"
+          echo " Keine rclone.conf gefunden. Einrichten mit:"
+          echo "   docker exec -it <dieser-container> rclone config"
+          echo " Remote-Name: sharepoint (Typ: onedrive -> SharePoint)"
+          echo " Danach diesen Container neu starten."
+          echo "============================================================"
+          exec tail -f /dev/null
+        fi
+
+        case "$$SHAREPOINT_REMOTE" in
+          *:) REMOTE="$${SHAREPOINT_REMOTE}$${SHAREPOINT_PATH}" ;;
+          *)  REMOTE="$${SHAREPOINT_REMOTE}$${SHAREPOINT_PATH:+/$$SHAREPOINT_PATH}" ;;
+        esac
+
+        until rclone mkdir "$$REMOTE" && rclone lsf --max-depth 1 "$$REMOTE" > /dev/null; do
+          echo "FEHLER: $$REMOTE nicht erreichbar – neuer Versuch in 60 s"
+          sleep 60
+        done
+        echo "SharePoint verbunden: $$REMOTE"
+
+        while true; do
+          # Kein Sync-Status im Volume (neues/leeres Volume) -> --resync:
+          # beide Seiten werden zusammengeführt, nichts wird gelöscht.
+          if [ -f "$$STATE/initialized" ]; then
+            set -- ; MODE="Abgleich"
+          else
+            set -- --resync --resync-mode newer ; MODE="Erstabgleich (--resync)"
+          fi
+          echo "$$(date "+%F %T") $$MODE /data <-> $$REMOTE ..."
+          if rclone bisync /data "$$REMOTE" "$$@" \
+               --workdir "$$WORKDIR" \
+               --exclude "/.rclone/**" \
+               --exclude "/tmp/**" \
+               --exclude "/filestore/plugins/**" \
+               --exclude "**/.*.tmp" \
+               --create-empty-src-dirs \
+               --resilient --recover --max-lock 10m \
+               --conflict-resolve newer --conflict-loser num \
+               --ignore-size --ignore-checksum \
+               --transfers 4 --checkers 8 --tpslimit 10 \
+               --log-level NOTICE --stats 0; then
+            # Dateien aus SharePoint gehören ResourceSpace (www-data, uid 33)
+            find /data/filestore ! -user 33 -exec chown 33:33 {} + 2>/dev/null
+            touch "$$STATE/initialized" "$$STATE/last_ok" "$$STATE/ready"
+            echo "$$(date "+%F %T") $$MODE erfolgreich."
+          else
+            echo "$$(date "+%F %T") FEHLER: $$MODE fehlgeschlagen (Details oben)."
+          fi
+          sleep "$$SYNC_INTERVAL"
+        done
+    volumes:
+      - data:/data
+      - rclone_config:/config/rclone
+    healthcheck:
+      # Erster Abgleich erledigt UND letzter erfolgreicher Abgleich < 60 min
+      test: ["CMD-SHELL", "test -f /data/.rclone/ready && find /data/.rclone/last_ok -mmin -60 | grep -q ."]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 1h
+    networks:
+      - egress
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  # ---------------------------------------------------------------------------
+  # Datenbank
+  # ---------------------------------------------------------------------------
+  mariadb:
+    image: mariadb:11.4
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD fehlt}
+      MARIADB_DATABASE: resourcespace
+      MARIADB_USER: resourcespace
+      MARIADB_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD fehlt}
+    volumes:
+      - db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - backend
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  # ---------------------------------------------------------------------------
+  # ResourceSpace
+  # ---------------------------------------------------------------------------
+  resourcespace:
+    image: ${RS_IMAGE:-friedrichrehren/resourcespace:latest}
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      rclone:
+        condition: service_healthy
+    environment:
+      RS_BASEURL: https://${RS_DOMAIN:?RS_DOMAIN fehlt}
+      RS_DB_HOST: mariadb
+      RS_DB_NAME: resourcespace
+      RS_DB_USER: resourcespace
+      RS_DB_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD fehlt}
+      RS_SCRAMBLE_KEY: ${RS_SCRAMBLE_KEY:?RS_SCRAMBLE_KEY fehlt}
+      RS_API_SCRAMBLE_KEY: ${RS_API_SCRAMBLE_KEY:?RS_API_SCRAMBLE_KEY fehlt}
+      RS_ADMIN_USERNAME: ${RS_ADMIN_USERNAME:-admin}
+      RS_ADMIN_PASSWORD: ${RS_ADMIN_PASSWORD:?RS_ADMIN_PASSWORD fehlt}
+      RS_ADMIN_EMAIL: ${RS_ADMIN_EMAIL:?RS_ADMIN_EMAIL fehlt}
+      RS_ADMIN_FORCE_PASSWORD: ${RS_ADMIN_FORCE_PASSWORD:-false}
+      RS_EMAIL_FROM: ${RS_EMAIL_FROM:-}
+      RS_SMTP_HOST: ${RS_SMTP_HOST:-}
+      RS_SMTP_PORT: ${RS_SMTP_PORT:-587}
+      RS_SMTP_USER: ${RS_SMTP_USER:-}
+      RS_SMTP_PASSWORD: ${RS_SMTP_PASSWORD:-}
+      RS_APPLICATION_NAME: ${RS_APPLICATION_NAME:-ResourceSpace}
+      RS_DEFAULT_LANGUAGE: ${RS_DEFAULT_LANGUAGE:-de}
+      RS_WAIT_FOR_SYNC: "true"
+      TZ: Europe/Berlin
+    volumes:
+      - data:/data
+    networks:
+      - traefik
+      - backend
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik"
+      # Router
+      - "traefik.http.routers.resourcespace.rule=Host(`${RS_DOMAIN}`)"
+      - "traefik.http.routers.resourcespace.entrypoints=https"
+      - "traefik.http.routers.resourcespace.service=resourcespace"
+      - "traefik.http.routers.resourcespace.middlewares=resourcespace-headers"
+      - "traefik.http.routers.resourcespace.tls=true"
+      - "traefik.http.routers.resourcespace.tls.certresolver=letsencrypt"
+      # Middleware (bewusst ohne strikte CSP – ResourceSpace nutzt Inline-JS)
+      - "traefik.http.middlewares.resourcespace-headers.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.resourcespace-headers.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.resourcespace-headers.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.resourcespace-headers.headers.customFrameOptionsValue=SAMEORIGIN"
+      - "traefik.http.middlewares.resourcespace-headers.headers.referrerPolicy=strict-origin-when-cross-origin"
+      # Service
+      - "traefik.http.services.resourcespace.loadbalancer.server.port=80"
+
+networks:
+  traefik:
+    external: true
+  backend:
+    internal: true
+  egress: {}
+
+volumes:
+  data:
+  db:
+  rclone_config:   # enthält die rclone.conf – Name beibehalten, dann bleibt der SharePoint-Login erhalten

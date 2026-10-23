@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# =============================================================================
+# ResourceSpace container entrypoint
+#
+#  1. Secrets from *_FILE variables (Docker/Portainer secrets)
+#  2. Data volume layout and PHP limits
+#  3. include/config.php from environment variables
+#  4. Wait for the first file sync (optional) and for the database
+#  5. Empty database: restore from dump if one exists, otherwise fresh install
+#  6. Upgrade routine, cron jobs, Apache in the foreground
+# =============================================================================
+set -Eeuo pipefail
+
+WEBROOT="${RS_WEBROOT:-/var/www/html}"
+LIB=/usr/local/lib/resourcespace
+DATA=/data
+DUMP_FILE="${DATA}/db-dump/resourcespace.sql.gz"
+
+log() { printf '[rs-entrypoint] %s\n' "$*"; }
+die() { printf '[rs-entrypoint] FEHLER: %s\n' "$*" >&2; exit 1; }
+
+# --- 1. *_FILE support -------------------------------------------------------
+for var in RS_DB_PASSWORD RS_SCRAMBLE_KEY RS_API_SCRAMBLE_KEY RS_ADMIN_PASSWORD RS_SMTP_PASSWORD; do
+  file_var="${var}_FILE"
+  if [[ -n "${!file_var:-}" ]]; then
+    [[ -r "${!file_var}" ]] || die "${file_var}: Datei ${!file_var} nicht lesbar"
+    export "${var}=$(<"${!file_var}")"
+  fi
+done
+
+for var in RS_BASEURL RS_DB_PASSWORD RS_SCRAMBLE_KEY RS_API_SCRAMBLE_KEY; do
+  [[ -n "${!var:-}" ]] || die "${var} ist nicht gesetzt."
+done
+if (( ${#RS_SCRAMBLE_KEY} < 32 || ${#RS_API_SCRAMBLE_KEY} < 32 )); then
+  die "RS_SCRAMBLE_KEY und RS_API_SCRAMBLE_KEY müssen mindestens 32 Zeichen lang sein (z. B. openssl rand -hex 32)."
+fi
+
+export RS_DB_HOST="${RS_DB_HOST:-mariadb}"
+export RS_DB_PORT="${RS_DB_PORT:-}"
+export RS_DB_NAME="${RS_DB_NAME:-resourcespace}"
+export RS_DB_USER="${RS_DB_USER:-resourcespace}"
+
+# --- 2. Data volume and PHP limits ------------------------------------------
+mkdir -p "${DATA}/filestore" "${DATA}/tmp" "${DATA}/db-dump" "${DATA}/config"
+chown www-data:www-data "${DATA}/filestore" "${DATA}/tmp"
+# Fix ownership of files that arrived from outside (e.g. restored via sync)
+find "${DATA}/filestore" "${DATA}/tmp" \( ! -user www-data -o ! -group www-data \) \
+  -exec chown www-data:www-data {} + 2>/dev/null || true
+chmod 0750 "${DATA}/db-dump"
+
+PHP_VERSION_DIR="$(find /etc/php -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
+cat > "${PHP_VERSION_DIR}/apache2/conf.d/99-resourcespace.ini" <<EOF
+upload_max_filesize = ${PHP_UPLOAD_MAX_FILESIZE:-1G}
+post_max_size = ${PHP_UPLOAD_MAX_FILESIZE:-1G}
+memory_limit = ${PHP_MEMORY_LIMIT:-1G}
+max_execution_time = ${PHP_MAX_EXECUTION_TIME:-300}
+max_input_time = ${PHP_MAX_EXECUTION_TIME:-300}
+expose_php = Off
+date.timezone = ${TZ:-Europe/Berlin}
+EOF
+cp "${PHP_VERSION_DIR}/apache2/conf.d/99-resourcespace.ini" "${PHP_VERSION_DIR}/cli/conf.d/99-resourcespace.ini"
+sed -i '/^upload_max_filesize\|^post_max_size\|^memory_limit\|^max_execution_time\|^max_input_time/d' \
+  "${PHP_VERSION_DIR}/cli/conf.d/99-resourcespace.ini"
+
+# --- 3. config.php -----------------------------------------------------------
+php "${LIB}/write-config.php" "${WEBROOT}/include/config.php"
+chown root:www-data "${WEBROOT}/include/config.php"
+chmod 0640 "${WEBROOT}/include/config.php"
+log "config.php aus Umgebungsvariablen erzeugt (${RS_BASEURL})."
+
+# Credentials for mariadb-client (dump/restore), readable by root only
+db_pw="${RS_DB_PASSWORD//\\/\\\\}"
+db_pw="${db_pw//\"/\\\"}"
+umask 077
+cat > /root/.my.cnf <<EOF
+[client]
+host=${RS_DB_HOST}
+user=${RS_DB_USER}
+password="${db_pw}"
+${RS_DB_PORT:+port=${RS_DB_PORT}}
+
+[mariadb-dump]
+single-transaction
+quick
+no-tablespaces
+EOF
+umask 022
+
+# --- 4. Wait for sync and database ------------------------------------------
+if [[ "${RS_WAIT_FOR_SYNC:-true}" == "true" ]]; then
+  waited=0
+  until [[ -e "${DATA}/.rclone/ready" ]]; do
+    (( waited % 60 == 0 )) && log "Warte auf ersten Abgleich mit SharePoint (${DATA}/.rclone/ready) ..."
+    sleep 5; waited=$(( waited + 5 ))
+  done
+  log "SharePoint-Abgleich bereit."
+fi
+
+waited=0
+until mariadb -e 'SELECT 1' "${RS_DB_NAME}" >/dev/null 2>&1; do
+  (( waited >= 300 )) && die "Datenbank ${RS_DB_HOST}/${RS_DB_NAME} nach 5 Minuten nicht erreichbar."
+  (( waited % 30 == 0 )) && log "Warte auf Datenbank ${RS_DB_HOST} ..."
+  sleep 3; waited=$(( waited + 3 ))
+done
+log "Datenbank erreichbar."
+
+# --- 5. Restore or fresh install --------------------------------------------
+run_as_www() { su -s /bin/bash www-data -c "$(printf '%q ' "$@")"; }
+export RS_WEBROOT="${WEBROOT}"
+
+table_count="$(mariadb -N -B -e \
+  "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()" "${RS_DB_NAME}")"
+
+if [[ "${table_count}" == "0" ]]; then
+  if [[ -s "${DUMP_FILE}" && "${RS_RESTORE_FROM_DUMP:-true}" == "true" ]]; then
+    log "Leere Datenbank, Dump gefunden: stelle ${DUMP_FILE} wieder her ..."
+    gunzip -c "${DUMP_FILE}" | mariadb "${RS_DB_NAME}"
+    log "Wiederherstellung abgeschlossen."
+  else
+    log "Leere Datenbank: führe Erstinstallation aus ..."
+    run_as_www php "${LIB}/setup.php" install
+    log "Erstinstallation abgeschlossen. Login: ${RS_ADMIN_USERNAME:-admin}"
+  fi
+elif [[ "${RS_ADMIN_FORCE_PASSWORD:-false}" == "true" ]]; then
+  log "RS_ADMIN_FORCE_PASSWORD=true: setze Admin-Passwort aus RS_ADMIN_PASSWORD."
+  run_as_www php "${LIB}/setup.php" admin-password
+fi
+
+# --- 6. Upgrade, cron, Apache -----------------------------------------------
+log "Prüfe Datenbankstruktur / Upgrades ..."
+run_as_www php "${WEBROOT}/upgrade/upgrade.php" >/dev/null
+
+# First dump right away if none exists yet
+[[ -s "${DUMP_FILE}" ]] || /usr/local/bin/rs-db-dump || log "WARNUNG: erster DB-Dump fehlgeschlagen."
+
+cat > /etc/cron.d/resourcespace <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RS_DB_NAME=${RS_DB_NAME}
+RS_WEBROOT=${WEBROOT}
+${RS_DB_DUMP_SCHEDULE:-0 */6 * * *} root /usr/local/bin/rs-db-dump > /proc/1/fd/1 2>&1
+${RS_CRON_SCHEDULE:-30 3 * * *} root su -s /bin/sh www-data -c 'php ${WEBROOT}/batch/cron.php' > /proc/1/fd/1 2>&1
+EOF
+chmod 0644 /etc/cron.d/resourcespace
+service cron start >/dev/null
+
+log "Starte Apache (ResourceSpace ${RS_RELEASE:-?} r${RS_REVISION:-?})."
+exec apachectl -D FOREGROUND
