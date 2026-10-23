@@ -3,9 +3,11 @@
   <p>Ready-to-use container image for the open-source digital asset management system <a href="https://www.resourcespace.com">ResourceSpace</a> – configured entirely through environment variables, no web installer.</p>
   <p>
     <a href="https://github.com/FriedrichRehren/resourcespace-docker/actions/workflows/check-upstream.yml"><img alt="Check Upstream Release" src="https://github.com/FriedrichRehren/resourcespace-docker/actions/workflows/check-upstream.yml/badge.svg?branch=main"></a>
+    <a href="https://github.com/FriedrichRehren/resourcespace-docker/actions/workflows/sync-dockerhub-readme.yml"><img alt="Sync Docker Hub README" src="https://github.com/FriedrichRehren/resourcespace-docker/actions/workflows/sync-dockerhub-readme.yml/badge.svg?branch=main"></a>
   </p>
   <p>
-    <a href="https://hub.docker.com/r/friedrichrehren/resourcespace/tags"><img alt="Current Version" src="https://img.shields.io/docker/v/friedrichrehren/resourcespace?sort=date&label=Current%20Version"></a>
+    <a href="https://hub.docker.com/r/friedrichrehren/resourcespace/tags"><img alt="Current Version" src="https://img.shields.io/docker/v/friedrichrehren/resourcespace?sort=semver&label=Current%20Version"></a>
+    <a href="https://github.com/users/friedrichrehren/packages/container/package/resourcespace"><img alt="GHCR Pulls" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fghcr-badge.elias.eu.org%2Fapi%2Ffriedrichrehren%2Fresourcespace&query=downloadCount&label=GHCR%20pulls&color=2ea44f&logo=github"></a>
     <a href="https://hub.docker.com/r/friedrichrehren/resourcespace"><img alt="Docker Hub Pulls" src="https://img.shields.io/docker/pulls/friedrichrehren/resourcespace?label=Docker%20Hub%20pulls&logo=docker&logoColor=white"></a>
   </p>
 </div>
@@ -42,10 +44,12 @@
 
 1. checks the ResourceSpace SVN repository once a day for the newest release
    branch and its latest revision
-2. builds a new image when that revision has not been published yet
+2. builds a new image when that revision is missing on GHCR or Docker Hub
 3. rebuilds once a week to pick up Ubuntu security updates
 4. runs a smoke test (fresh install, admin login, dump, restore) and only then
    pushes to Docker Hub and GHCR
+5. keeps its scheduled workflows enabled – GitHub would otherwise disable them
+   after 60 days without commits
 
 ## Quick Start
 
@@ -195,12 +199,22 @@ image keeps the same Ubuntu base and runtime packages, but
 
 ## Repository Setup
 
-Secrets for the workflows (same as `yt-dlp-docker`):
+### Workflows
+
+| Workflow | Trigger | Purpose |
+| --- | --- | --- |
+| `check-upstream.yml` | daily, weekly (forced), push to `main`, manual | publishes new SVN revisions (`<release>-r<revision>`, `<release>`, `latest`) |
+| `deploy.yml` | called by `check-upstream.yml` | builds, smoke-tests and pushes the image |
+| `sync-dockerhub-readme.yml` | README change, after releases, manual | copies this README to Docker Hub |
+| `keepalive.yml` | weekly, manual | re-enables all scheduled workflows so GitHub does not disable them |
+
+### Secrets and Variables
 
 | Secret | Purpose |
 | --- | --- |
 | `DOCKERHUB_USERNAME` | Docker Hub user |
-| `DOCKERHUB_TOKEN` | Docker Hub access token (read/write) |
+| `DOCKERHUB_TOKEN` | Docker Hub access token, scope *Read & Write* (image push) |
+| `DOCKERHUB_README_TOKEN` | optional: token with scope *Read, Write, Delete* – Docker Hub requires it to update the repository description. Falls back to `DOCKERHUB_TOKEN` |
 
 Optional repository variable `RS_RELEASE` pins the release branch (e.g. `11.0`);
 default is the newest branch.
