@@ -26,7 +26,7 @@ on:
         required: true
         default: "latest"
       force:
-        description: "Build even if the image tag already exists"
+        description: "Rebuild and push even if the version is already published"
         required: true
         default: false
         type: boolean
@@ -36,12 +36,13 @@ permissions:
   packages: write
 
 concurrency:
-  group: deploy-image
+  group: deploy-release
   cancel-in-progress: false
 
 env:
+  IMAGE_NAME: resourcespace
+  DOCKERHUB_NAMESPACE: friedrichrehren
   SVN_RELEASES: https://svn.resourcespace.com/svn/rs/releases
-  DOCKERHUB_IMAGE: docker.io/friedrichrehren/resourcespace
 
 jobs:
   check:
@@ -49,11 +50,12 @@ jobs:
     runs-on: ubuntu-latest
 
     outputs:
-      should_deploy: ${{ steps.check.outputs.should_deploy }}
       rs_release: ${{ steps.check.outputs.rs_release }}
       rs_revision: ${{ steps.check.outputs.rs_revision }}
       version: ${{ steps.check.outputs.version }}
       tags: ${{ steps.check.outputs.tags }}
+      push_ghcr: ${{ steps.check.outputs.push_ghcr }}
+      push_dockerhub: ${{ steps.check.outputs.push_dockerhub }}
 
     steps:
       - name: Install Subversion
@@ -68,8 +70,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          owner="${GITHUB_REPOSITORY_OWNER,,}"
-          ghcr_image="ghcr.io/${owner}/resourcespace"
+          ghcr_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}"
+          dockerhub_image="docker.io/${DOCKERHUB_NAMESPACE}/${IMAGE_NAME}"
 
           newest="$(svn ls "${SVN_RELEASES}/" | sed -n 's#^\([0-9][0-9.]*\)/$#\1#p' | sort -V | tail -n1)"
           if [[ "${INPUT_RELEASE}" == "latest" ]]; then
@@ -82,49 +84,43 @@ jobs:
           revision="$(svn info --show-item last-changed-revision "${SVN_RELEASES}/${release}")"
           version="${release}-r${revision}"
 
+          tags="${version} ${release}"
+          if [[ "${release}" == "${newest}" ]]; then tags="${tags} latest"; fi
+
+          missing() { ! docker buildx imagetools inspect "$1" >/dev/null 2>&1; }
+
+          push_ghcr=false
+          push_dockerhub=false
+          if [[ "${FORCE}" == "true" ]] || missing "${ghcr_image}:${version}"; then push_ghcr=true; fi
+          if [[ "${FORCE}" == "true" ]] || missing "${dockerhub_image}:${version}"; then push_dockerhub=true; fi
+
           echo "Newest release branch: ${newest}"
           echo "Selected release:      ${release}"
           echo "Revision:              ${revision}"
-          echo "Image version:         ${version}"
+          echo "Tags:                  ${tags}"
           echo "Forced:                ${FORCE}"
+          echo "Push to GHCR:          ${push_ghcr}"
+          echo "Push to Docker Hub:    ${push_dockerhub}"
 
           {
             echo "rs_release=${release}"
             echo "rs_revision=${revision}"
             echo "version=${version}"
-          } >> "${GITHUB_OUTPUT}"
-
-          exists() { docker buildx imagetools inspect "$1" >/dev/null 2>&1; }
-
-          if [[ "${FORCE}" != "true" ]] \
-             && exists "${ghcr_image}:${version}" \
-             && exists "${DOCKERHUB_IMAGE}:${version}"; then
-            echo "${version} is already published"
-            echo "should_deploy=false" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          echo "should_deploy=true" >> "${GITHUB_OUTPUT}"
-          {
-            echo "tags<<EOF"
-            for image in "${ghcr_image}" "${DOCKERHUB_IMAGE}"; do
-              echo "${image}:${version}"
-              echo "${image}:${release}"
-              if [[ "${release}" == "${newest}" ]]; then
-                echo "${image}:latest"
-              fi
-            done
-            echo "EOF"
+            echo "tags=${tags}"
+            echo "push_ghcr=${push_ghcr}"
+            echo "push_dockerhub=${push_dockerhub}"
           } >> "${GITHUB_OUTPUT}"
 
   deploy:
     name: Deploy Image
     needs: check
-    if: needs.check.outputs.should_deploy == 'true'
+    if: needs.check.outputs.push_ghcr == 'true' || needs.check.outputs.push_dockerhub == 'true'
     uses: ./.github/workflows/deploy.yml
     with:
       rs_release: ${{ needs.check.outputs.rs_release }}
       rs_revision: ${{ needs.check.outputs.rs_revision }}
       version: ${{ needs.check.outputs.version }}
       tags: ${{ needs.check.outputs.tags }}
+      push_ghcr: ${{ needs.check.outputs.push_ghcr == 'true' }}
+      push_dockerhub: ${{ needs.check.outputs.push_dockerhub == 'true' }}
     secrets: inherit

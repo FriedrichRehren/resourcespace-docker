@@ -1,0 +1,66 @@
+name: Sync Docker Hub README
+
+# Copies README.md to the Docker Hub repository description.
+# Docker Hub only accepts this with a token that has the scope
+# "Read, Write, Delete" (DOCKERHUB_README_TOKEN); pushing images needs only
+# "Read & Write" (DOCKERHUB_TOKEN), which is used as a fallback.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - README.md
+      - .github/workflows/sync-dockerhub-readme.yml
+  # The Docker Hub repository only exists after the first image push,
+  # so sync again whenever a release build has finished.
+  workflow_run:
+    workflows:
+      - Check Upstream Release
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-dockerhub-readme
+  cancel-in-progress: true
+
+env:
+  DOCKERHUB_REPOSITORY: friedrichrehren/resourcespace
+  SHORT_DESCRIPTION: ResourceSpace DAM, configured via environment variables
+
+jobs:
+  sync:
+    name: Sync Docker Hub README
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check that the Docker Hub repository exists
+        id: repo
+        shell: bash
+        run: |
+          status="$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${DOCKERHUB_REPOSITORY}/")"
+          if [[ "${status}" == "200" ]]; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::notice::Docker Hub repository ${DOCKERHUB_REPOSITORY} not found (HTTP ${status}); it is synced after the first image push."
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Update Docker Hub README
+        if: steps.repo.outputs.exists == 'true'
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_README_TOKEN || secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_REPOSITORY }}
+          short-description: ${{ env.SHORT_DESCRIPTION }}
+          readme-filepath: ./README.md
